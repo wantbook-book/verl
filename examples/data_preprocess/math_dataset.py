@@ -16,13 +16,13 @@ Preprocess the MATH-lighteval dataset to parquet format
 """
 
 import argparse
+import json
 import os
 
 import datasets
 
 from verl.utils.hdfs_io import copy, makedirs
 from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
-import json
 
 
 def extract_solution(solution_str):
