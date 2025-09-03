@@ -672,6 +672,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
+        breakpoint()
         # Support all hardwares
         data = data.to(get_device_id())
 
@@ -719,6 +720,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
+        breakpoint()
         prompts = prompts.to(get_device_id())
 
         assert self._is_rollout
@@ -731,6 +733,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.generation_config is not None
             else self.tokenizer.pad_token_id,
         }
+        
+        # 检查并添加SAE相关配置
+        sae_config = getattr(self.config.rollout, 'sae', {})
+        if sae_config.get("enable", False):
+            meta_info.update({
+                "sae_enabled": True,
+                "sae_strength": sae_config.get("strength", 1.0),
+            })
+            print(f"🔥 SAE enabled for rollout generation.")
+        
         prompts.meta_info.update(meta_info)
         timing_generate = {}
         with self.rollout_sharding_manager:
@@ -749,6 +761,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # to make sure meta_info["timing"] is the same
         timing_generate = reduce_timing(timing_generate)
         output.meta_info["timing"] = timing_generate
+        
+        # 记录SAE相关统计信息
+        if sae_config.get("enable", False) and hasattr(output, 'meta_info'):
+            if output.meta_info.get("sae_enabled", False):
+                print("✅ SAE rollout generation completed successfully")
+                # 记录SAE强度统计信息（如果可用）
+                if "sae_strengths" in output.meta_info:
+                    strengths = output.meta_info["sae_strengths"]
+                    print(f"📊 SAE strengths statistics:")
+                    print(f"   - Mean: {strengths.mean():.4f}")
+                    print(f"   - Std: {strengths.std():.4f}")
+                    print(f"   - Shape: {strengths.shape}")
+        
         output = output.to("cpu")
 
         # clear kv cache

@@ -1,0 +1,157 @@
+# SAE集成的PPO训练配置示例
+# 基于标准PPO配置，添加SAE相关设置
+
+# 基础配置
+trainer:
+  project_name: "sae_enhanced_ppo"
+  experiment_name: "sae_feature_steering"
+  logger: ["console", "tracking"]  # tracking可以是wandb或其他
+  
+  # 训练参数
+  total_epochs: 10
+  rollout_batch_size: 512
+  n_gpus_per_node: 8
+  nnodes: 1
+  
+  # 保存和日志
+  save_freq: 1
+  log_freq: 10
+
+# 模型配置
+model:
+  path: "/path/to/your/base/llm/model"  # 基础LLM模型路径
+  lora_rank: 0  # 不使用LoRA，因为我们训练独立的强度预测器
+  trust_remote_code: true
+
+# SAE配置 - 新增部分
+sae:
+  enable: true  # 启用SAE特征叠加
+  model_path: "/path/to/your/sae/model"  # SAE模型路径
+  
+  # SAE模型配置
+  hidden_size: 4096  # 必须与LLM的hidden_size匹配
+  num_features: 512  # SAE特征数量
+  target_layer: -1   # 在哪一层应用特征叠加 (-1表示最后一层)
+  
+  # 强度预测器配置
+  predictor_hidden_size: 1024  # 预测器隐层大小
+  predictor_layers: 2  # 预测器层数
+  max_strength: 5.0   # 最大强度值
+  min_strength: -5.0  # 最小强度值
+  dropout: 0.1        # 预测器dropout
+  activation: "relu"  # 激活函数
+  
+  # 训练配置
+  strength_scale: 1.0      # 强度缩放因子
+  enable_steering: true    # 是否启用特征引导
+  freeze_base_model: true  # 冻结基础模型参数
+  
+  # 验证配置
+  validation:
+    enable_steering: true    # 验证时是否启用SAE
+    strength_scale: 0.8     # 验证时的强度缩放
+
+# Actor/Rollout配置
+actor_rollout_ref:
+  actor:
+    strategy: fsdp  # 使用FSDP策略
+    optim:
+      lr: 1e-5  # 基础模型学习率（实际上会被冻结）
+      eps: 1e-5
+      weight_decay: 0.0
+    
+    # SAE强度预测器专用优化器配置
+    sae_optim:  # 新增：专门为SAE强度预测器的优化器
+      lr: 1e-4  # 强度预测器学习率
+      eps: 1e-5
+      weight_decay: 1e-4
+  
+  rollout:
+    name: vllm_rollout  # 推荐使用vllm_rollout（支持SAE）
+    # name: naive  # 也可以使用naive rollout（已修改支持SAE）
+    
+    response_length: 512
+    temperature: 0.7
+    top_k: 50
+    do_sample: true
+    
+    # vLLM rollout 特定配置
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.9
+    enforce_eager: true  # SAE需要eager模式
+    dtype: "float16"
+    
+    # SAE配置（vLLM rollout专用）
+    sae:
+      enable: true
+      # 方式1：从本地路径加载
+      model_path: "/path/to/sae/model"
+      
+      # 方式2：从HuggingFace Hub加载
+      # release: "andreuka18/deepseek-r1-distill-llama-8b-lmsys-openthoughts"
+      # id: "blocks.19.hook_resid_post"
+      
+      # SAE干预配置 - 单特征模式
+      feature_idx: 1160  # 特定特征索引（可选）
+      strength_scale: 1.0  # 全局强度缩放
+      max_activation: 5.0  # 最大激活值（用于clamp）
+      steering_layer: -1   # 干预层位置
+      
+      # SAE干预配置 - 多特征模式（与单特征模式互斥）
+      # feature_idxs: [1160, 2340, 890]  # 多个特征索引
+      # max_activations: [5.0, 3.0, 4.0]  # 对应的最大激活值
+      # strengths: [1.0, 1.5, 0.8]  # 对应的强度
+    
+    # rollout验证配置
+    val_kwargs:
+      do_sample: true
+      temperature: 0.7
+      top_k: 50
+
+# Critic配置
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1e-5
+    eps: 1e-5
+    weight_decay: 0.0
+
+# 算法配置
+algorithm:
+  kl_penalty: 0.05
+  cliprange: 0.2
+  cliprange_value: 0.2
+  gamma: 1.0
+  lam: 0.95
+  
+  # SAE相关算法配置
+  sae_strength_loss_weight: 1.0  # 强度预测损失权重
+  use_sae_reward: false  # 是否使用SAE相关的奖励信号
+
+# 数据配置
+data:
+  train_files: ["/path/to/train/data.jsonl"]
+  val_files: ["/path/to/val/data.jsonl"]
+  
+  # 数据格式应包含问题和（可选的）目标强度
+  # 示例格式：
+  # {"prompt": "问题文本", "target_strengths": [0.1, 0.5, -0.2, ...]}  # 可选
+  
+  max_prompt_length: 1024
+  max_response_length: 512
+  shuffle: true
+  
+# 奖励模型配置
+reward_model:
+  enable: true
+  path: "/path/to/reward/model"
+  strategy: fsdp
+
+# Ray配置
+ray_init:
+  num_cpus: 32
+
+# 其他配置
+seed: 42
+dtype: bf16

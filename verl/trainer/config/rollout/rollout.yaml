@@ -76,6 +76,15 @@ n: 1
 # Whether to wake up inference engine in multi-stage. (Wake up model weights first, then resume kv cache)
 multi_stage_wake_up: false
 
+sae:
+  enable: False
+  path: null
+  feature_idxs: null
+  strengths: null
+  max_activations: null
+  release: null
+  id: null
+
 # Extra inference engine arguments (vllm, sglang).
 engine_kwargs:
 

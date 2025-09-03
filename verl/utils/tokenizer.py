@@ -60,6 +60,18 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
+    
+    # Add chat template for Gemma models if missing
+    if isinstance(name_or_path, str) and "gemma" in name_or_path.lower() and tokenizer.chat_template is None:
+        gemma_chat_template = """{% for message in messages %}{% if message['role'] == 'user' %}<start_of_turn>user
+{{ message['content'] }}<end_of_turn>
+{% elif message['role'] == 'assistant' %}<start_of_turn>model
+{{ message['content'] }}<end_of_turn>
+{% endif %}{% endfor %}{% if add_generation_prompt %}<start_of_turn>model
+{% endif %}"""
+        tokenizer.chat_template = gemma_chat_template
+        warnings.warn(f"Added default chat template for Gemma model: {name_or_path}", stacklevel=1)
+    
     return tokenizer
 
 

@@ -55,6 +55,18 @@ from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
+# SAE相关导入
+try:
+    from sae_lens import SAE
+    SAE_AVAILABLE = True
+except ImportError:
+    SAE = None
+    SAE_AVAILABLE = False
+import functools
+# GlobalSAE控制机制
+class GlobalSAE:
+    use_sae = True
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -62,6 +74,191 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
 # 3. simplify init logics
+
+
+def get_intervention_hook(sae, feature_idx, strength=1.0, max_activation=1.0):
+    """
+    创建SAE干预hook，参考SAE-Reasoning2实现
+    
+    Args:
+        sae: SAE模型
+        feature_idx: 特征索引
+        strength: 干预强度
+        max_activation: 最大激活值
+    """
+    def hook_fn(module, input, output):
+        if not GlobalSAE.use_sae:
+            return output
+            
+        # 处理输出格式
+        if torch.is_tensor(output):
+            activations = output.clone()
+        else:
+            activations = output[0].clone()
+        
+        try:
+            # 确保SAE在正确的设备上
+            if sae.device != activations.device:
+                sae.device = activations.device
+                sae.to(sae.device)
+            
+            # 编码-解码-重构误差方法
+            features = sae.encode(activations)
+            reconstructed = sae.decode(features)
+            error = activations.to(features.dtype) - reconstructed
+            
+            features[..., feature_idx] = max_activation * strength
+            
+            # 重构激活并添加误差
+            activations_hat = sae.decode(features) + error
+            activations_hat = activations_hat.type_as(activations)
+            
+            if torch.is_tensor(output):
+                return activations_hat
+            else:
+                return (activations_hat,) + output[1:] if len(output) > 1 else (activations_hat,)
+                
+        except Exception as e:
+            print(f"⚠️ SAE intervention hook error: {e}")
+            return output
+    
+    return hook_fn
+
+
+def get_clamp_hook(direction, max_activation, strength):
+    """
+    创建特征钳制hook，参考SAE-Reasoning2实现
+    
+    Args:
+        direction: 特征方向向量
+        max_activation: 最大激活值
+        strength: 强度
+    """
+    def hook_fn(module, input, output):
+        if not GlobalSAE.use_sae:
+            return output
+            
+        # 处理输出格式
+        if torch.is_tensor(output):
+            activations = output.clone()
+        else:
+            activations = output[0].clone()
+        
+        try:
+            # 标准化方向向量
+            direction_normalized = direction / torch.norm(direction)
+            direction_normalized = direction_normalized.type_as(activations)
+            
+            # 计算投影大小
+            proj_magnitude = torch.sum(activations * direction_normalized, dim=-1, keepdim=True)
+            
+            # 计算正交分量
+            orthogonal_component = activations - proj_magnitude * direction_normalized
+            
+            # 钳制并重构
+            clamped = orthogonal_component + direction_normalized * max_activation * strength
+            
+            if torch.is_tensor(output):
+                return clamped
+            else:
+                return (clamped,) + output[1:] if len(output) > 1 else (clamped,)
+                
+        except Exception as e:
+            print(f"⚠️ SAE clamp hook error: {e}")
+            return output
+    
+    return hook_fn
+
+
+def get_multi_intervention_hook(
+    sae: SAE,
+    feature_idxs: list[int],
+    max_activations: list[float],
+    strengths: list[float],
+):
+    def hook_fn(module, input, output):
+        if not GlobalSAE.use_sae:
+            return output
+
+        if torch.is_tensor(output):
+            activations = output.clone()
+        else:
+            activations = output[0].clone()
+
+        if sae.device != activations.device:
+            sae.device = activations.device
+            sae.to(sae.device)
+
+        # import torch.distributed as dist
+        # # 只在rank 0执行SAE计算
+        # if not dist.is_initialized() or dist.get_rank() == 0:
+        #     features = sae.encode(activations)
+        #     reconstructed = sae.decode(features)
+        #     error = activations.to(features.dtype) - reconstructed
+            
+        #     for feature_idx, max_activation, strength in zip(feature_idxs, max_activations, strengths):
+        #         features[..., feature_idx] = max_activation * strength
+            
+        #     activations_hat = sae.decode(features) + error
+        #     activations_hat = activations_hat.type_as(activations)
+        # else:
+        #     # 其他rank直接返回原activations
+        #     activations_hat = activations
+
+        # # 广播结果到所有ranks
+        # if dist.is_initialized():
+            # dist.broadcast(activations_hat, src=0)
+
+        # TP>1，在这里已经聚合了，会重复执行？
+        features = sae.encode(activations)
+        reconstructed = sae.decode(features)
+        error = activations.to(features.dtype) - reconstructed
+
+        for feature_idx, max_activation, strength in zip(feature_idxs, max_activations, strengths):
+            features[..., feature_idx] = max_activation * strength
+
+        activations_hat = sae.decode(features) + error
+        activations_hat = activations_hat.type_as(activations)
+
+        if torch.is_tensor(output):
+            return activations_hat
+        else:
+            return (activations_hat,) + output[1:] if len(output) > 1 else (activations_hat,)
+
+    return hook_fn
+
+@contextmanager
+def add_hooks(
+    module_forward_pre_hooks: list,
+    module_forward_hooks: list,
+    **kwargs
+):
+    """
+    上下文管理器，用于添加和移除hooks，参考SAE-Reasoning2实现
+    
+    Args:
+        module_forward_pre_hooks: 前置hook列表 [(module, hook_fn), ...]
+        module_forward_hooks: 后置hook列表 [(module, hook_fn), ...]
+        **kwargs: 传递给hook函数的额外参数
+    """
+    try:
+        handles = []
+        # 注册前置hooks
+        for module, hook in module_forward_pre_hooks:
+            partial_hook = functools.partial(hook, **kwargs)
+            handles.append(module.register_forward_pre_hook(partial_hook))
+        
+        # 注册后置hooks
+        for module, hook in module_forward_hooks:
+            partial_hook = functools.partial(hook, **kwargs)
+            handles.append(module.register_forward_hook(partial_hook))
+        yield
+    finally:
+        # 清理所有hooks
+        for h in handles:
+            h.remove()
+
+
 
 
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
@@ -205,6 +402,144 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        
+        # SAE相关属性
+        self.sae = None
+        self.sae_config = {}
+        self._sae_hooks = []
+        breakpoint()
+        self._load_sae_from_config(config)
+
+    def _load_sae_from_config(self, config: DictConfig):
+        """从配置加载SAE模型"""
+        if not SAE_AVAILABLE:
+            return
+        
+        # 检查配置中是否有SAE设置
+        sae_config = getattr(config, 'sae', {})
+        if not sae_config or not sae_config.get('enable', False):
+            return
+        
+        try:
+            sae_model_path = sae_config.get('path')
+            if sae_model_path:
+                print(f"🔄 Loading SAE from {sae_model_path}...")
+                self.sae = SAE.load_from_pretrained(path=sae_model_path)
+                self.sae_config = sae_config
+                print(f"✅ SAE loaded successfully")
+            else:
+                # 支持从release和id加载
+                sae_release = sae_config.get('release')
+                sae_id = sae_config.get('id')
+                if sae_release and sae_id:
+                    print(f"🔄 Loading SAE from release: {sae_release}, id: {sae_id}")
+                    self.sae, _, _ = SAE.from_pretrained(release=sae_release, sae_id=sae_id)
+                    self.sae_config = sae_config
+                    print(f"✅ SAE loaded successfully")
+                    
+        except Exception as e:
+            print(f"⚠️ Failed to load SAE: {e}")
+            self.sae = None
+            self.sae_config = {}
+
+    def _setup_sae_hooks(self) -> list:
+        """设置SAE hooks，参考SAE-Reasoning2实现"""
+        if self.sae is None:
+            return []
+        
+        sae_hooks = []
+        
+        try:
+            # 获取vLLM模型
+            lm_model = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner.model
+            
+            # 获取SAE配置参数
+            feature_idxs = self.sae_config.get('feature_idxs')  # 支持多特征
+            if feature_idxs:
+                feature_idxs = list(map(int, feature_idxs.split(',')))
+                if len(feature_idxs) == 1:
+                    feature_idx = feature_idxs[0]
+
+            strengths = self.sae_config.get('strengths')
+            if strengths:
+                strengths = list(map(float, strengths.split(',')))
+                if len(strengths) == 1:
+                    strength = strengths[0]
+
+            max_activations = self.sae_config.get('max_activations')
+            if max_activations:
+                max_activations = list(map(float, max_activations.split(',')))
+                if len(max_activations) == 1:
+                    max_activation = max_activations[0]
+
+            # 确定hook层
+            hook_layer = self.sae.cfg.hook_layer
+            target_module = lm_model.model.layers[hook_layer]
+            
+            # 选择合适的hook类型
+            if feature_idxs is not None and isinstance(feature_idxs, (list, tuple)):
+                # 多特征干预
+                hook_fn = get_multi_intervention_hook(
+                    self.sae, 
+                    feature_idxs=feature_idxs,
+                    max_activations=max_activations,
+                    strengths=strengths
+                )
+                print(f"🎯 Setup multi-feature SAE hook on layer {hook_layer} for features {feature_idxs}")
+                
+            else:
+                # 单特征干预
+                # if max_activation is not None:
+                #     # 使用clamp hook
+                #     direction = self.sae.W_dec[feature_idx].clone()
+                #     hook_fn = get_clamp_hook(direction, max_activation, strength)
+                #     print(f"🎯 Setup clamp SAE hook on layer {hook_layer} for feature {feature_idx}")
+                # else:
+                # 使用intervention hook
+                hook_fn = get_intervention_hook(
+                    self.sae, 
+                    feature_idx=feature_idx, 
+                    strength=strength,
+                    max_activation=max_activation
+                )
+                print(f"🎯 Setup intervention SAE hook on layer {hook_layer} for feature {feature_idx}")
+            
+            sae_hooks.append((target_module, hook_fn))
+            
+        except Exception as e:
+            print(f"⚠️ Failed to setup SAE hooks: {e}")
+        
+        return sae_hooks
+
+    def _apply_sae_hooks(self):
+        """
+        应用SAE hooks到vLLM模型，返回hook上下文管理器
+        
+        Args:
+            meta_info: 包含SAE配置的元信息
+            
+        Returns:
+            hook_context: hook上下文管理器
+        """
+        if self.sae is None:
+            return None
+        
+        try:
+            # 设置SAE hooks
+            sae_hooks = self._setup_sae_hooks()
+            
+            if not sae_hooks:
+                return None
+            
+            # 返回hook上下文管理器，使用SAE-Reasoning2风格的add_hooks
+            return add_hooks(
+                module_forward_pre_hooks=[],  # 我们主要使用forward hooks
+                module_forward_hooks=sae_hooks
+            )
+            
+        except Exception as e:
+            print(f"⚠️ Failed to apply SAE hooks: {e}")
+            return None
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -254,6 +589,23 @@ class vLLMRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
+        
+        # 检查是否启用SAE特征叠加
+        breakpoint()
+        sae_enabled = self.sae_config.get('enable', False) and self.sae is not None
+        
+        if sae_enabled:
+            print("🔥 SAE enabled in vLLM rollout")
+            print(f"   SAE config: {self.sae_config}")
+            
+            # 启用GlobalSAE
+            GlobalSAE.use_sae = True
+            
+        else:
+            # 禁用GlobalSAE
+            GlobalSAE.use_sae = False
+            if self.sae_config.get('enable', False) and self.sae is None:
+                print("⚠️ SAE enabled in config but no SAE model loaded")
 
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
@@ -314,14 +666,41 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
+        # 应用SAE特征叠加（如果启用）
+        sae_hook_context = None
+        if sae_enabled:
+            try:
+                print("🎯 Applying SAE hooks to vLLM model...")
+                sae_hook_context = self._apply_sae_hooks()
+                if sae_hook_context:
+                    print("✅ SAE hooks context created")
+                else:
+                    print("⚠️ Failed to create SAE hooks context")
+                    sae_enabled = False
+            except Exception as e:
+                print(f"⚠️ Failed to apply SAE hooks: {e}")
+                sae_enabled = False
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
+            # 使用SAE hooks上下文管理器进行生成
+            if sae_hook_context:
+                with sae_hook_context:
+                    print("🚀 Generating with SAE hooks active...")
+                    outputs = self.inference_engine.generate(
+                        prompts=vllm_inputs,
+                        sampling_params=self.sampling_params,
+                        lora_request=lora_requests,
+                        use_tqdm=False,
+                    )
+                print("✅ SAE generation completed, hooks removed")
+            else:
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                )
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -381,7 +760,18 @@ class vLLMRollout(BaseRollout):
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        # 添加SAE相关信息到meta_info
+        meta_info = {}
+        if sae_enabled:
+            meta_info["sae_enabled"] = True
+            meta_info["sae_config"] = self.sae_config
+            if 'sae_params' in locals():
+                meta_info.update(sae_params)
+            print("✅ vLLM SAE rollout completed with SAE intervention")
+        else:
+            meta_info["sae_enabled"] = False
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
 
 # https://github.com/vllm-project/vllm/issues/13175

@@ -739,6 +739,18 @@ class RayPPOTrainer:
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            
+            # 添加SAE配置到meta_info（如果启用）
+            sae_config = getattr(self.config, 'sae', {})
+            if sae_config.get("enable", False):
+                test_gen_batch_padded.meta_info.update({
+                    "sae_enabled": True,
+                    "sae_strength_scale": sae_config.get("strength_scale", 1.0),
+                    "sae_steering_layer": sae_config.get("target_layer", -1),
+                    "sae_enable_steering": sae_config.get("enable_steering", True),
+                })
+                print(f"🔥 SAE enabled for validation generation with strength_scale: {sae_config.get('strength_scale', 1.0)}")
+            
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
@@ -746,6 +758,14 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
+            # 记录SAE统计信息（如果启用）
+            if sae_config.get("enable", False) and hasattr(test_output_gen_batch, 'meta_info'):
+                if test_output_gen_batch.meta_info.get("sae_enabled", False):
+                    print("✅ SAE validation generation completed successfully")
+                    if "sae_strengths" in test_output_gen_batch.meta_info:
+                        strengths = test_output_gen_batch.meta_info["sae_strengths"]
+                        print(f"📊 Validation SAE strengths - mean: {strengths.mean():.4f}, std: {strengths.std():.4f}")
 
             print("validation generation end")
 
