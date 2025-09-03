@@ -407,7 +407,7 @@ class vLLMRollout(BaseRollout):
         self.sae = None
         self.sae_config = {}
         self._sae_hooks = []
-        breakpoint()
+        # breakpoint()
         self._load_sae_from_config(config)
 
     def _load_sae_from_config(self, config: DictConfig):
@@ -591,7 +591,7 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
         
         # 检查是否启用SAE特征叠加
-        breakpoint()
+        # breakpoint()
         sae_enabled = self.sae_config.get('enable', False) and self.sae is not None
         
         if sae_enabled:

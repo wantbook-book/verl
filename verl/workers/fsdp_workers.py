@@ -672,7 +672,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
-        breakpoint()
+        # breakpoint()
         # Support all hardwares
         data = data.to(get_device_id())
 
@@ -720,7 +720,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
-        breakpoint()
+        # breakpoint()
         prompts = prompts.to(get_device_id())
 
         assert self._is_rollout

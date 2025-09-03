@@ -3,8 +3,8 @@ set -x
 export VLLM_USE_V1=0
 # gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 # gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-math_train_path=/pubshare/fwk/code/data/math/train.parquet
-math_test_path=/pubshare/fwk/code/data/math/test.parquet
+math_train_path=/angel/fwk/code/verl/data/math/train.parquet
+math_test_path=/angel/fwk/code/verl/data/math/test.parquet
 
 # train_files="['$gsm8k_train_path', '$math_train_path']"
 train_files="['$math_train_path']"
@@ -18,7 +18,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=1536 \
     data.max_response_length=512 \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/pubshare/LLM/deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
+    actor_rollout_ref.model.path=/angel/fwk/models/deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
     actor_rollout_ref.actor.optim.lr=3e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=1 \
